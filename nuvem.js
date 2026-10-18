@@ -83,7 +83,7 @@ NUVEM.salva = async function(texto){
 };
 
 /* ---------- inicialização ---------- */
-(async function(){
+async function iniciaNuvem(){
   try {
     tela('<h2>Planner Semanal</h2><p>Carregando…</p>');
     if (!(await iniciaLogin())) return;
@@ -105,7 +105,7 @@ NUVEM.salva = async function(texto){
     } else erroTela('Não foi possível abrir o planner', (e && e.message) || String(e));
     console.error(e);
   }
-})();
+}
 
 function carregaScript(src){
   return new Promise((ok, no) => { const s = document.createElement('script'); s.src = src + '?v=' + (window.PLANNER_VERSAO || '1'); s.onload = ok; s.onerror = () => no(new Error('Falha ao carregar ' + src)); document.body.appendChild(s); });
@@ -238,4 +238,184 @@ function instalaCamada(){
   });
   window.addEventListener('beforeunload', ev => { if (PODE() && (sujo || gravando || timer)){ ev.preventDefault(); ev.returnValue = ''; } });
 }
+
+/* =====================================================================
+   MODO ARQUIVO (sem login Microsoft): abre e salva o Planner_Dados.json
+   da pasta sincronizada do OneDrive. Ativo quando CLIENT_ID está vazio.
+   ===================================================================== */
+const MODO_ARQ = !CFG.CLIENT_ID;
+const temFS = typeof window.showOpenFilePicker === 'function';
+let HANDLE = null, ULT_MOD = 0, ULT_SAVED = null, PENDENTE = false, ULT_MUDANCA = 0;
+const NOME_ARQ = 'Planner_Dados.json';
+const BKP = 'plannerArq:backup';
+
+function idb(){ return new Promise((res, rej) => { const r = indexedDB.open('plannerArquivo2', 1); r.onupgradeneeded = () => r.result.createObjectStore('h'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); }
+async function idbGet(k){ try { const db = await idb(); return await new Promise(res => { const q = db.transaction('h').objectStore('h').get(k); q.onsuccess = () => res(q.result || null); q.onerror = () => res(null); }); } catch (e){ return null; } }
+async function idbSet(k, v){ try { const db = await idb(); db.transaction('h', 'readwrite').objectStore('h').put(v, k); } catch (e){} }
+
+function statusArq(classe, texto, dica){
+  const el = $n('statusSave'); if (!el) return;
+  el.className = 'status ' + classe; $n('statusTxt').textContent = texto; el.title = dica || ''; el.onclick = null;
+}
+function leJson(texto){
+  let o; try { o = JSON.parse(texto); } catch (e){ throw new Error('O arquivo não é um JSON válido.'); }
+  if (!o || typeof o !== 'object' || !(o.semanas || Array.isArray(o.tarefas))) throw new Error('Esse arquivo não parece ser os dados do planner (Planner_Dados.json).');
+  return o;
+}
+function pickPorInput(){
+  return new Promise(res => {
+    const inp = document.createElement('input'); inp.type = 'file'; inp.accept = '.json,application/json';
+    inp.onchange = async () => { const f = inp.files[0]; res(f ? { texto: (await f.text()).replace(/^\uFEFF/, ''), nome: f.name, mod: f.lastModified } : null); };
+    inp.oncancel = () => res(null);
+    inp.click();
+  });
+}
+async function pickPorHandle(h){
+  const op = { mode: 'readwrite' };
+  if ((await h.queryPermission(op)) !== 'granted' && (await h.requestPermission(op)) !== 'granted') throw new Error('Permissão de gravação negada.');
+  const f = await h.getFile();
+  return { texto: (await f.text()).replace(/^\uFEFF/, ''), nome: h.name, mod: f.lastModified };
+}
+async function escolheArquivo(){
+  if (temFS){
+    let h;
+    try { [h] = await window.showOpenFilePicker({ id: 'plannerDados', startIn: 'documents', types: [{ description: 'Dados do planner', accept: { 'application/json': ['.json'] } }] }); }
+    catch (e){ if (e && e.name === 'AbortError') return null; throw e; }
+    const d = await pickPorHandle(h);
+    HANDLE = h; await idbSet('dados', h);
+    return d;
+  }
+  return await pickPorInput();
+}
+function backupNovo(dadosSavedAt){
+  try { const b = JSON.parse(localStorage.getItem(BKP) || 'null'); if (b && b.E && (Date.parse(b.E.savedAt || 0) || 0) > (Date.parse(dadosSavedAt || 0) || 0)) return b; } catch (e){}
+  return null;
+}
+function aplicaTexto(texto, aviso){
+  const o = leJson(texto);
+  ULT_SAVED = o.savedAt || null;
+  return o;
+}
+
+async function sobe(d){
+  let o = aplicaTexto(d.texto);
+  let texto = d.texto;
+  const b = backupNovo(o.savedAt);
+  if (b && confirm('Este aparelho tem alterações não salvas de ' + hora(b.E.savedAt) + ', mais novas que o arquivo. Restaurá-las?\n\nOK = restaurar   Cancelar = usar o arquivo')){ o = b.E; texto = JSON.stringify(o); PENDENTE = true; }
+  ULT_MOD = d.mod || 0;
+  $n('estado').textContent = texto;
+  await carregaScript('app.js');
+  instalaCamadaArquivo();
+  render(); statusOcioso();
+  telaOff();
+}
+
+async function recarregaDoArquivo(){
+  if ((PENDENTE || sujo) && !confirm('Há alterações ainda não salvas. Abrir o arquivo agora vai descartá-las. Continuar?')) return;
+  try {
+    const d = HANDLE ? await pickPorHandle(HANDLE) : await escolheArquivo();
+    if (!d) return;
+    const o = aplicaTexto(d.texto);
+    E = migra(o); provisoria = null; S = null; ABERTAS = {}; MODAL_ID = null; ULT_MOD = d.mod || 0; PENDENTE = false;
+    try { localStorage.removeItem(BKP); } catch (e){}
+    render(); statusOcioso(); toast('Dados carregados de ' + d.nome + '.');
+  } catch (e){ alert(e.message || e); }
+}
+
+function conflitoArq(){
+  return new Promise(res => {
+    tela('<h2>O arquivo mudou fora daqui</h2><p>Outro dispositivo salvou uma versão mais nova do Planner_Dados.json. Se continuar, uma das versões será perdida.</p><div class="nvAc"><button class="btn" id="nvArq">Carregar a versão do arquivo (descarta o que não salvei)</button><button class="btn pri" id="nvMinhaArq">Sobrescrever com a minha</button></div>');
+    $n('nvArq').onclick = async () => { telaOff(); try { const d = await pickPorHandle(HANDLE); const o = aplicaTexto(d.texto); E = migra(o); provisoria = null; S = null; ABERTAS = {}; MODAL_ID = null; ULT_MOD = d.mod; render(); toast('Versão do arquivo carregada.'); } catch (e){ alert(e.message || e); } res('arquivo'); };
+    $n('nvMinhaArq').onclick = () => { telaOff(); res('minha'); };
+  });
+}
+
+function baixaJson(nome, conteudo){ const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([conteudo], { type: 'application/json' })); a.download = nome; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 4000); }
+async function salvarDados(){
+  if (HANDLE){ clearTimeout(timer); await window.gravaAgora(); toast('Salvo em ' + HANDLE.name + '.'); return; }
+  E.savedAt = agora();
+  const json = JSON.stringify(E, null, 1);
+  try { localStorage.setItem(BKP, JSON.stringify({ E })); } catch (e){}
+  const arq = new File([json], NOME_ARQ, { type: 'application/json' });
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [arq] })){
+      await navigator.share({ files: [arq], title: NOME_ARQ });
+      PENDENTE = false; try { localStorage.removeItem(BKP); } catch (e){} statusOcioso();
+      toast('Escolha "Salvar em Arquivos", abra a pasta do OneDrive e substitua o ' + NOME_ARQ + '.');
+      return;
+    }
+  } catch (e){ if (e && e.name === 'AbortError') return; }
+  baixaJson(NOME_ARQ, json);
+  PENDENTE = false; try { localStorage.removeItem(BKP); } catch (e){} statusOcioso();
+  toast('Arquivo baixado. Mova-o para a pasta do OneDrive, substituindo o anterior.');
+}
+
+function instalaCamadaArquivo(){
+  MODO_EDICAO = true;
+  document.body.classList.remove('leitura');
+  window.marcaStatus = statusArq;
+  window.statusOcioso = function(){
+    if (HANDLE) statusArq('arq', 'Gravando em ' + HANDLE.name + (E.savedAt ? ' · ' + hora(E.savedAt) : ''), 'Cada alteração é gravada direto no arquivo.');
+    else if (PENDENTE) statusArq('local', 'Não salvo no arquivo — toque em Salvar dados', 'Há alterações só neste aparelho.');
+    else statusArq('arq', 'Dados carregados' + (E.savedAt ? ' · ' + hora(E.savedAt) : ''), 'Toque em Salvar dados ao terminar de editar.');
+  };
+  window.mudou = function(){ ULT_MUDANCA = Date.now(); sincroniza(); fixa(); if (!HANDLE){ PENDENTE = true; try { E.savedAt = agora(); localStorage.setItem(BKP, JSON.stringify({ E })); } catch (e){} statusOcioso(); } agenda(); };
+  window.gravaAgora = async function(){
+    if (!HANDLE) return;
+    if (gravando){ sujo = true; return; }
+    gravando = true; sujo = false;
+    statusArq('grav', 'Gravando…');
+    try {
+      const f = await HANDLE.getFile();
+      if (f.lastModified !== ULT_MOD){
+        const o = JSON.parse(((await f.text()) || 'null').replace(/^\uFEFF/, ''));
+        if (o && o.savedAt !== ULT_SAVED){ gravando = false; const r = await conflitoArq(); if (r === 'arquivo') return; gravando = true; }
+      }
+      E.savedAt = agora();
+      const w = await HANDLE.createWritable(); await w.write(JSON.stringify(E, null, 1)); await w.close();
+      ULT_SAVED = E.savedAt; ULT_MOD = (await HANDLE.getFile()).lastModified;
+    } catch (e){
+      gravando = false; sujo = true;
+      statusArq('erro', 'Falha ao gravar — clique em Salvar dados', String(e && e.message || e));
+      return;
+    }
+    gravando = false; statusOcioso(); if (sujo) agenda();
+  };
+  window.salvarMovel = window.vincular = window.tentaReconectar = function(){};
+  window.guardaRapido = function(){};
+  const bc = $n('btnCopia'); if (bc) bc.style.display = 'none';
+  const bv = $n('btnVincular'); bv.style.display = ''; bv.textContent = '💾 Salvar dados'; bv.className = 'btn pri'; bv.title = 'Grava as alterações no Planner_Dados.json da pasta do OneDrive.'; bv.onclick = salvarDados;
+  const ba = $n('btnAcesso'); ba.textContent = '📂 Abrir dados'; ba.className = 'btn'; ba.title = 'Recarrega os dados do arquivo (para pegar o que foi salvo em outro dispositivo).'; ba.onclick = recarregaDoArquivo;
+
+  async function confere(){
+    if (!HANDLE || document.hidden || sujo || gravando || MODAL_ID || Date.now() - ULT_MUDANCA < 4000) return;
+    try {
+      if ((await HANDLE.queryPermission({ mode: 'readwrite' })) !== 'granted') return;
+      const f = await HANDLE.getFile();
+      if (f.lastModified === ULT_MOD) return;
+      const o = JSON.parse(((await f.text()) || 'null').replace(/^\uFEFF/, ''));
+      ULT_MOD = f.lastModified;
+      if (o && o.savedAt && o.savedAt !== ULT_SAVED){
+        ULT_SAVED = o.savedAt; E = migra(o); provisoria = null; S = null; ABERTAS = {}; render(); statusOcioso();
+        toast('Atualizado com a versão salva em outro dispositivo.');
+      }
+    } catch (e){}
+  }
+  setInterval(confere, 30000);
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') confere(); });
+  window.addEventListener('beforeunload', ev => { if (PENDENTE || sujo){ ev.preventDefault(); ev.returnValue = ''; } });
+}
+
+async function iniciaArquivo(){
+  const h = temFS ? await idbGet('dados') : null;
+  tela('<h2>Planner Semanal</h2><p>Abra o arquivo <b>' + NOME_ARQ + '</b> da sua pasta do OneDrive. Ele guarda todos os dados do planner.</p><div class="nvAc">' +
+    (h ? '<button class="btn" id="nvCont">Continuar com ' + escH(h.name) + '</button>' : '') +
+    '<button class="btn pri" id="nvAbrir">📂 Abrir dados</button></div><p style="margin:12px 0 0;font-size:12px" id="nvMsg"></p>');
+  const msg = t => { $n('nvMsg').textContent = t || ''; };
+  $n('nvAbrir').onclick = async () => { try { const d = await escolheArquivo(); if (d) await sobe(d); } catch (e){ msg(e.message || String(e)); } };
+  const c = $n('nvCont');
+  if (c) c.onclick = async () => { try { const d = await pickPorHandle(h); HANDLE = h; await sobe(d); } catch (e){ msg(e.message || String(e)); } };
+}
+
+if (MODO_ARQ) iniciaArquivo(); else iniciaNuvem();
 })();
